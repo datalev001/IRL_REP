@@ -1,42 +1,43 @@
+# -*- coding: utf-8 -*-
+"""
+E-commerce Promotion & Repeat (Scenario A) · IRL/GRPO training (data-only, no generator)
+----------------------------------------------------------------------------
+Inputs (must already exist):
+  - C:/pj/promo_traj.csv
+  - C:/pj/context_daily.csv
 
+Outputs (all saved to the same directory C:/pj):
+  - irlA_w.npy, irlA_scaler.npz
+  - irlB_w.npy, irlB_scaler.npz
+  - grpo_actor.pt
+  - ope_snips.csv
+  - today_offer_recos.csv
+  - exec_summary.txt
+  - Several visualization PNGs (weights, confusion matrix, training curve, OPE comparison, daily recommendation mix)
+"""
 
-# ======================================================================
-# ======= LOAD DATA FROM YOUR PATH, THEN MIRROR TO ./data
-# ======================================================================
 from pathlib import Path
-import pandas as pd
-SAVE_DIR = Path("C:/RL")            # your persistent location
-LOCAL_DIR = Path("./data"); LOCAL_DIR.mkdir(exist_ok=True)
-
-# Read the data you generated earlier
-traj = pd.read_csv(SAVE_DIR / "promo_traj.csv", parse_dates=["date"])
-ctx  = pd.read_csv(SAVE_DIR / "context_daily.csv", parse_dates=["date"])
-
-# Mirror to ./data so the unchanged training code below works out-of-the-box
-traj.to_csv(LOCAL_DIR / "promo_traj.csv", index=False)
-ctx.to_csv(LOCAL_DIR / "context_daily.csv", index=False)
-
-# ======================================================================
-# ================= IRL → GRPO (Enhanced; code unchanged) ==============
-# ======================================================================
-
 import os, json, math
-from pathlib import Path
 import numpy as np
+import pandas as pd
+
+# Use a non-interactive matplotlib backend so it runs in any environment
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 
 # ----------------------------- Config -----------------------------
-DATA_DIR   = Path("./data")
+DATA_DIR   = Path("C:/pj")   # single path for both inputs and outputs
 PROMOS     = ["C5","C10","FS","BDL","LP","MSG"]
 VAL_SPLIT  = 0.85
 RNG_SEED   = 2025
 np.random.seed(RNG_SEED)
 torch.manual_seed(RNG_SEED)
 
-# Costs / business params (align with generator)
+# Business cost parameters (must match the ones used during data generation)
 OP_COST      = {"HOLD":0.0, "PROMO":0.03}
 COUPON_COST  = {"C5":5.0, "C10":10.0}
 SHIP_COST    = 8.0
@@ -50,16 +51,23 @@ DELTA_FATIGUE = 0.2
 # GRPO (critic-free, group-relative)
 EPOCHS_GRPO = 25
 LR_GRPO     = 2e-4
-TAU_LIST    = 0.8          # policy softmax temp
-TAU_REF     = 0.9          # reference softmax temp (for r→π_ref)
+TAU_LIST    = 0.8          # actor softmax temperature
+TAU_REF     = 0.9          # reference softmax temperature (derived from rewards)
 BETA_KL     = 0.2          # KL(π||π_ref) weight
 COST_COEF   = 0.05
 ENT_COEF    = 0.01
 
 # ------------------------- Utilities -------------------------
 def ensure_inputs():
-    if not (DATA_DIR / "promo_traj.csv").exists():
-        raise FileNotFoundError("Missing ./data/promo_traj.csv (make sure you placed CSVs under C:/backupcgi/final_bak; this script mirrors them to ./data at start).")
+    a = DATA_DIR / "promo_traj.csv"
+    b = DATA_DIR / "context_daily.csv"
+    if not a.exists() or not b.exists():
+        missing = []
+        if not a.exists(): missing.append(str(a))
+        if not b.exists(): missing.append(str(b))
+        raise FileNotFoundError(
+            "noCSV，place ：\n  - " + "\n  - ".join(missing)
+        )
 
 def log1p_scale(x):      # for recency_days
     return np.log1p(np.maximum(0.0, x))
@@ -87,18 +95,18 @@ need_cols = [
 ]
 for c in need_cols:
     if c not in traj.columns:
-        raise RuntimeError(f"promo_traj.csv missing column: {c}")
+        raise RuntimeError(f"promo_traj.csv no columns: {c}")
 
 traj = traj[need_cols].copy().sort_values("date").reset_index(drop=True)
 
-# ------------------------- Optional context (for AOV_lag) -------------------------
-_ctx_path = DATA_DIR / "context_daily.csv"
+# ------------------------- Optional context (for AOV lag lookup) -------------------------
 _ctx_idx = None
+_ctx_path = DATA_DIR / "context_daily.csv"
 if _ctx_path.exists():
     ctx_df = pd.read_csv(_ctx_path, parse_dates=["date"])
     _ctx_idx = ctx_df.set_index(["date","category"])
 else:
-    print("[WARN] context_daily.csv not found; reward evaluator will fallback to AOV=150.")
+    print("[WARN] Not finding context_daily.csv，AOV using default: 150.")
 
 def _get_ctx_aov_lag(row):
     aov_lag = 150.0
@@ -118,7 +126,7 @@ val_dates   = set(dates_all[cut_idx:])
 VAL_START   = pd.to_datetime(dates_all[cut_idx]) if cut_idx < len(dates_all) else traj["date"].max()
 print(f"[split] train_days={len(train_dates)}  val_days={len(val_dates)}  val_start={VAL_START.date()}")
 
-# ------------------------- Candidate rules -------------------------
+# ------------------------- Candidate rule set -------------------------
 def feasible_variants(row):
     inv_idx = float(row["inv_idx"])
     elig    = int(row["coupon_elig"])
@@ -131,7 +139,7 @@ def feasible_variants(row):
         cand = ["C5","MSG"]
     return cand
 
-# ------------------------- Stage-A: IRL (PROMO vs HOLD) -------------------------
+# ------------------------- Stage-A: IRL (binary classification) -------------------------
 A_cols_raw = [
     "price_sens","disc_aff","engage","churn","cat_aff","inv_idx","margin_rate","seasonality",
     "fatigue","comp_price_idx","coupon_elig",
@@ -182,23 +190,26 @@ def stageA_train():
         prec= tp/max(1,tp+fp); rec = tp/max(1,tp+fn); f1 = 2*prec*rec/max(1e-9,prec+rec)
         nll = -np.mean(y*np.log(p+1e-12)+(1-y)*np.log(1-p+1e-12))
         return dict(n=len(y), acc=acc, precision=prec, recall=rec, f1=f1, nll=nll)
+
     print("\n[Stage-A Eval]")
     print("  train:", eval_A(XA[mtr], yA[mtr], wA_star))
     print("    val:", eval_A(XA[mva], yA[mva], wA_star))
 
-    # save weights/scaler
+    # Save weights & scaler
     np.save(DATA_DIR/"irlA_w.npy", wA_star)
     np.savez(DATA_DIR/"irlA_scaler.npz", **scalerA)
 
-    # weights plot
+    # Weight bar chart
     names = A_cols_raw + ["bias"]
     plt.figure(figsize=(7.5,3.2))
     plt.bar(range(len(wA_star)), wA_star)
     plt.xticks(range(len(wA_star)), names, rotation=30, ha="right")
     plt.title("Stage-A Feature Weights (PROMO vs HOLD)")
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    plt.savefig(DATA_DIR/"plot_stageA_weights.png", dpi=150)
+    plt.close()
 
-    # confusion on val
+    # Confusion matrix on validation
     p = sigmoid(XA[mva] @ wA_star); pred=(p>=0.5).astype(int); y=yA[mva]
     cm = np.zeros((2,2), dtype=int)
     for yt, yp in zip(y, pred): cm[int(yt),int(yp)] += 1
@@ -210,18 +221,20 @@ def stageA_train():
     ax.set_xticks([0,1]); ax.set_xticklabels(["HOLD","PROMO"])
     ax.set_yticks([0,1]); ax.set_yticklabels(["HOLD","PROMO"])
     ax.set_xlabel("Pred"); ax.set_ylabel("Actual"); ax.set_title("Stage-A Confusion (Val)")
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    plt.savefig(DATA_DIR/"plot_stageA_confusion_val.png", dpi=150)
+    plt.close()
+
     return wA_star, scalerA
 
 wA_star, scalerA = stageA_train()
 
-# ------------------------- Stage-B: IRL (which promo, with interactions) -------------------------
+# ------------------------- Stage-B: IRL (multiclass softmax) -------------------------
 B_base_cols = [
     "price_sens","disc_aff","engage","churn","cat_aff","inv_idx","margin_rate","seasonality",
     "fatigue","comp_price_idx","coupon_elig","recency_days",
     "ret60_lag1","price_vs_ma20_lag1","vol20_lag1"
 ]
-# Variant-dependent interaction features (constructed per candidate)
 INTER_NAMES = [
     "ps_x_coupon",     # price_sens × 1[coupon]
     "inv_x_bundle",    # inv_idx × 1[BDL]
@@ -232,7 +245,7 @@ INTER_NAMES = [
 
 def build_B_matrix_and_scaler(df):
     Xb = df[B_base_cols].astype(float).values.copy()
-    # recency -> log1p
+    # recency_days -> log1p
     idx_rec = B_base_cols.index("recency_days")
     Xb[:, idx_rec] = log1p_scale(Xb[:, idx_rec])
     mean = Xb.mean(axis=0)
@@ -255,7 +268,7 @@ def build_B_feature_row(row, variant, scaler=None):
     onehot = np.zeros(len(PROMOS), dtype=np.float64)
     if variant in PROMOS: onehot[PROMOS.index(variant)] = 1.0
 
-    # variant-dependent interactions
+    # Variant-dependent interactions
     is_coupon = 1.0 if variant in ("C5","C10") else 0.0
     is_bdl    = 1.0 if variant=="BDL" else 0.0
     is_lp     = 1.0 if variant=="LP" else 0.0
@@ -286,7 +299,7 @@ def stageB_build_sets():
         cands = feasible_variants(row)
         if len(cands)==0: continue
         if not isinstance(row["ticker"], str) or row["ticker"] not in cands: continue
-        # put expert choice at idx 0
+        # Put the logged expert's choice at index 0
         cands = [row["ticker"]] + [x for x in cands if x != row["ticker"]]
         Xk = np.vstack([build_B_feature_row(row, v, scaler=scalerB) for v in cands])
         if row["date"] in train_dates:
@@ -337,8 +350,7 @@ def ndcg_at_k(X_list, y, w, k=3, tau=0.8):
         order = np.argsort(-p)
         rank = int(np.where(order==yk)[0][0]) + 1
         dcg = 1.0 / math.log2(rank+1)
-        idcg = 1.0  # single relevant item
-        tot += dcg / idcg
+        tot += dcg
     return tot / max(1,len(y))
 
 print("\n[Stage-B Eval]")
@@ -347,15 +359,17 @@ print("    val top1:", top1_acc(X_B_va, y_B_va, wB_star, tau=0.8))
 print("  train NDCG@3:", ndcg_at_k(X_B_tr, y_B_tr, wB_star, k=3, tau=0.8))
 print("    val NDCG@3:", ndcg_at_k(X_B_va, y_B_va, wB_star, k=3, tau=0.8))
 
-# Stage-B weights plot (includes one-hot & interactions)
+# Stage-B weight plot (includes one-hot & interactions)
 namesB = B_base_cols + [f"1hot_{v}" for v in PROMOS] + INTER_NAMES + ["bias"]
 plt.figure(figsize=(10.5,3.2))
 plt.bar(range(len(wB_star)), wB_star)
 plt.xticks(range(len(wB_star)), namesB, rotation=35, ha="right")
 plt.title("Stage-B Feature Weights (Which Promo, with interactions)")
-plt.tight_layout(); plt.show()
+plt.tight_layout()
+plt.savefig(DATA_DIR/"plot_stageB_weights.png", dpi=150)
+plt.close()
 
-# ------------------------- GRPO: critic-free, group-relative -------------------------
+# ------------------------- GRPO (critic-free, group-relative) -------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class GRPOActor(nn.Module):
@@ -375,7 +389,7 @@ def softmax_t(x, tau):
     e = torch.exp(torch.clamp(x-m, -50, 50))
     return e / (e.sum() + 1e-12)
 
-# Deterministic business reward evaluator (no randomness)
+# Deterministic business reward estimator (aligned with generator logic)
 def _expected_reward_for_variant(row, variant):
     ps   = float(row.get("price_sens", 0.5))
     da   = float(row.get("disc_aff", 0.5))
@@ -405,7 +419,8 @@ def _expected_reward_for_variant(row, variant):
 
     p_conv = float(np.clip(base_conv + uplift, 0.001, 0.9))
 
-    aov_exp = aov_lag * (1.0 + (0.10 if variant=="BDL" else 0.0) - (0.06 if cpi<0.9 else 0.0) - (0.05 if inv<0.12 else 0.0))
+    aov_exp = aov_lag * (1.0 + (0.10 if variant=="BDL" else 0.0)
+                         - (0.06 if cpi<0.9 else 0.0) - (0.05 if inv<0.12 else 0.0))
 
     promo_cost = 0.0
     if variant in ("C5","C10"): promo_cost = COUPON_COST[variant]
@@ -415,14 +430,14 @@ def _expected_reward_for_variant(row, variant):
     exp_gross= margin * aov_exp * p_conv
     exp_profit = exp_gross - exp_cost
 
-    p_rep = float(np.clip(0.08 + 0.15*engage + 0.06*p_conv + 0.05*coupon_elig - 0.04*(variant in ("C10","C5") and ps>0.8), 0.01, 0.8))
+    p_rep = float(np.clip(0.08 + 0.15*engage + 0.06*p_conv + 0.05*coupon_elig
+                          - 0.04*(variant in ("C10","C5") and ps>0.8), 0.01, 0.8))
     reward = exp_profit + ALPHA_REP * p_rep - DELTA_FATIGUE * fatigue
     return float(reward)
 
 def reward_vector_for_group(row, cands):
     return np.array([_expected_reward_for_variant(row, v) for v in cands], dtype=np.float32)
 
-# Build GRPO training groups: learn only where A-head PROMO prob ≥ 0.50
 def build_A_matrix_full(df):
     X, sc = build_A_matrix(df)  # reuse Stage-A scaler
     return X, sc
@@ -445,7 +460,8 @@ def build_grpo_groups(df, gate=0.50):
     return groups
 
 grpo_tr_groups = build_grpo_groups(traj, gate=0.50)
-# Build validation groups with the same gate (val days only)
+
+# Validation groups (use the same gate)
 grpo_va_groups = []
 XA_all, _ = build_A_matrix_full(traj)
 def p_A_idx(i): return float(sigmoid(XA_all[i] @ wA_star))
@@ -478,16 +494,16 @@ def grpo_epoch(groups, train=True):
             logits = actor(X)                                                  # (K,)
             p = softmax_t(logits, TAU_LIST)                                    # (K,)
 
-            # group-relative advantage (zero mean, unitized)
+            # Group-relative advantage (zero mean, normalized)
             r_mean = r.mean()
             r_std  = torch.clamp(r.std(unbiased=False), min=1e-3)
             A = (r - r_mean) / r_std
 
             eps = 1e-12
-            # KL to reference π_ref(r)
+            # KL to reference policy π_ref(r)
             kl = torch.sum(p * (torch.log(p + eps) - torch.log(p_ref + eps)))
 
-            # policy gradient
+            # Policy gradient objective
             loss_pg = -(A.detach() * torch.log(p + eps)).sum()
             loss_cost = (p * c).sum()
             ent = -(p * torch.log(p + eps)).sum()
@@ -507,19 +523,21 @@ for ep in range(1, EPOCHS_GRPO+1):
     if ep % 5 == 0:
         print(f"[GRPO] epoch {ep:02d} | train={loss_tr:.4f} | val={loss_va:.4f}")
 
-# save actor
+# Save actor weights
 torch.save(actor.state_dict(), DATA_DIR/"grpo_actor.pt")
 
-# plot training curve
+# Plot training curve
 ep_axis, tr_vals, va_vals = zip(*train_curve)
 plt.figure(figsize=(6.5,3.2))
 plt.plot(ep_axis, tr_vals, label="train")
 plt.plot(ep_axis, va_vals, label="val")
 plt.xlabel("epoch"); plt.ylabel("loss")
 plt.title("GRPO Training Curve (critic-free, group-relative)")
-plt.legend(); plt.tight_layout(); plt.show()
+plt.legend(); plt.tight_layout()
+plt.savefig(DATA_DIR/"plot_grpo_curve.png", dpi=150)
+plt.close()
 
-# ------------------------- OPE: SNIPS (val window) -------------------------
+# ------------------------- OPE: SNIPS (validation window) -------------------------
 def pi_b_IRLB(row, cands, tau=0.8):
     Xk = np.vstack([build_B_feature_row(row, v, scaler=scalerB) for v in cands])
     z  = Xk @ wB_star
@@ -528,7 +546,7 @@ def pi_b_IRLB(row, cands, tau=0.8):
 def pi_e_actor(row, cands):
     Xk = np.vstack([build_B_feature_row(row, v, scaler=scalerB) for v in cands]).astype(np.float32)
     with torch.no_grad():
-        logits = actor(torch.tensor(Xk, device=DEVICE)).cpu().numpy()
+        logits = actor(torch.tensor(Xk, dtype=torch.float32, device=DEVICE)).cpu().numpy()
     z = logits / max(TAU_LIST, 1e-6); z = z - np.max(z)
     e = np.exp(np.clip(z, -50, 50))
     return e / (e.sum()+1e-12)
@@ -551,7 +569,7 @@ for _, row in val_df.iterrows():
 
 ope_df = pd.DataFrame(ope_logs)
 if len(ope_df)==0:
-    print("[OPE] No validation PROMO rows to evaluate.")
+    print("[OPE] No PROMO in validation set")
 else:
     cap = 50.0
     w = np.clip(ope_df["w"].values.astype(np.float64), 0.0, cap)
@@ -559,11 +577,10 @@ else:
     ips   = float(np.mean(w * r))
     snips = float((w * r).sum() / (w.sum() + 1e-12))
 
-    # baseline: average logged reward on the same rows
     baseline = float(r.mean())
     delta_snips = float(snips - baseline)
 
-    # bootstrap CI
+    # Bootstrap CI
     BOOT = 300
     rng = np.random.default_rng(RNG_SEED)
     bs = []
@@ -574,16 +591,18 @@ else:
         bs.append(float((wb*rb).sum() / (wb.sum()+1e-12)))
     lo, hi = float(np.percentile(bs, 2.5)), float(np.percentile(bs, 97.5))
 
-    # save table
+    # Save table
     ope_df.to_csv(DATA_DIR/"ope_snips.csv", index=False)
 
-    # plot to Spyder
+    # Visualization
     fig, ax = plt.subplots(figsize=(6.0,3.2))
     ax.bar([0,1], [baseline, snips], width=0.45, tick_label=["Logged Baseline","SNIPS (Pred)"])
     ax.errorbar([1], [snips], yerr=[[snips-lo],[hi-snips]], fmt='o', capsize=4, label="95% CI")
     ax.axhline(0, color="k", lw=0.6)
     ax.set_title(f"OPE - SNIPS vs Baseline  (Δ={delta_snips:.3f}, N={len(ope_df)})")
-    ax.legend(); plt.tight_layout(); plt.show()
+    ax.legend(); plt.tight_layout()
+    plt.savefig(DATA_DIR/"plot_ope_snips.png", dpi=150)
+    plt.close()
 
     print(json.dumps({
         "OPE":{
@@ -597,7 +616,7 @@ else:
         }
     }, ensure_ascii=False, indent=2))
 
-# ------------------------- Demo: Today's top offers + explanations -------------------------
+# ------------------------- Demo: today's top offers + explanations -------------------------
 def stageA_prob_for_row(row):
     x = row[A_cols_raw].astype(float).values.copy()
     x = np.hstack([x, np.array([1.0])])
@@ -647,46 +666,41 @@ if len(reco)>0:
     plt.figure(figsize=(5.5,3.2))
     plt.bar(cnt.index, cnt.values)
     plt.title(f"Today Reco Variant Mix - {str(last_day.date())}")
-    plt.tight_layout(); plt.show()
-    print(f"[Demo] Saved: data/today_offer_recos.csv  (rows={len(df_reco)})")
+    plt.tight_layout()
+    plt.savefig(DATA_DIR/"plot_today_reco_mix.png", dpi=150)
+    plt.close()
+    print(f"[Demo] Saved: today_offer_recos.csv  (rows={len(df_reco)})")
 else:
-    print("[Demo] No A-head PROMO contexts found for the last day.")
+    print("[Demo] no last day sample: A-head PROMO gate 。")
 
 # ------------------------- Executive summary -------------------------
 lines = []
 lines.append(f"- Train/Val split: {len(train_dates)} / {len(val_dates)} days (val_start={VAL_START.date()}).")
-
 if (DATA_DIR/"irlA_w.npy").exists():
-    lines.append("- IRL-A (PROMO vs HOLD) trained; plots shown in Spyder.")
+    lines.append("- IRL-A (PROMO vs HOLD) trained; weights & plots saved.")
 
 if (DATA_DIR/"irlB_w.npy").exists():
     try:
         top1_tr_val = top1_acc(X_B_tr, y_B_tr, wB_star, tau=0.8) if len(X_B_tr) > 0 else float('nan')
         top1_va_val = top1_acc(X_B_va, y_B_va, wB_star, tau=0.8) if len(X_B_va) > 0 else float('nan')
-        if 'ndcg_at_k' in globals():
-            ndcg_tr = ndcg_at_k(X_B_tr, y_B_tr, wB_star, 3, 0.8) if len(X_B_tr) > 0 else float('nan')
-            ndcg_va = ndcg_at_k(X_B_va, y_B_va, wB_star, 3, 0.8) if len(X_B_va) > 0 else float('nan')
-            lines.append(
-                f"- IRL-B (Which Promo) top1 train/val: {top1_tr_val:.3f} / {top1_va_val:.3f}; "
-                f"NDCG@3 train/val: {ndcg_tr:.3f} / {ndcg_va:.3f}."
-            )
-        else:
-            lines.append(
-                f"- IRL-B (Which Promo) top1 train/val: {top1_tr_val:.3f} / {top1_va_val:.3f}."
-            )
+        ndcg_tr = ndcg_at_k(X_B_tr, y_B_tr, wB_star, 3, 0.8) if len(X_B_tr) > 0 else float('nan')
+        ndcg_va = ndcg_at_k(X_B_va, y_B_va, wB_star, 3, 0.8) if len(X_B_va) > 0 else float('nan')
+        lines.append(
+            f"- IRL-B (Which Promo) top1 train/val: {top1_tr_val:.3f} / {top1_va_val:.3f}; "
+            f"NDCG@3 train/val: {ndcg_tr:.3f} / {ndcg_va:.3f}."
+        )
     except Exception as e:
-        lines.append(f"- IRL-B metrics not available ({e}).")
+        lines.append(f"- IRL-B metrics unavailable ({e}).")
 
-lines.append(f"- GRPO (critic-free) trained {EPOCHS_GRPO} epochs; curve shown in Spyder.")
+lines.append(f"- GRPO (critic-free) trained for {EPOCHS_GRPO} epochs; curve saved.")
 
 if (DATA_DIR/"ope_snips.csv").exists():
-    lines.append("- OPE SNIPS computed; bar chart vs baseline shown in Spyder.")
+    lines.append("- OPE SNIPS computed and saved.")
 
 if (DATA_DIR/"today_offer_recos.csv").exists():
-    lines.append("- Demo exported: today_offer_recos.csv; variant mix plot shown in Spyder.")
+    lines.append("- Demo exported: today_offer_recos.csv (with explanations and mix plot).")
 
-(Path(DATA_DIR/"exec_summary.txt")).write_text("\n".join(lines), encoding="utf-8")
+(DATA_DIR/"exec_summary.txt").write_text("\n".join(lines), encoding="utf-8")
 print("\n=== Executive Summary ===")
 print("\n".join(lines))
-print("\n✓ Done. All artifacts written under ./data/ (plots shown in Spyder)")
-
+print("\n✓ Done. written to: C:/backupcgi/final_bak")
